@@ -1,0 +1,222 @@
+{
+  "name": "Контент-конвейер: темы в посты",
+  "settings": {},
+  "nodes": [
+    {
+      "id": "wh-1",
+      "name": "Приём тем",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "content-pipeline",
+        "responseMode": "responseNode"
+      }
+    },
+    {
+      "id": "code-split",
+      "name": "Темы в элементы",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const topics = $input.first().json.body.topics || [];\nif (!topics.length) throw new Error('в запросе нет списка topics');\nreturn topics.map((t) => ({ json: { topic: String(t) } }));"
+      }
+    },
+    {
+      "id": "http-ai",
+      "name": "Пост через модель",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        400,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AI_BASE_URL }}/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.AI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.AI_MODEL, temperature: 0.7, messages: [ { role: 'system', content: 'Ты пишешь короткие посты для соцсетей малого бизнеса. 500-700 знаков, живым языком, без канцелярита и эмодзи-списков. Один конкретный совет, один пример, в конце вопрос читателям. Запрещено выдумывать статистику, проценты и исследования — если нужен довод, используй бытовой пример, а не цифру.' }, { role: 'user', content: 'Тема поста: ' + $json.topic } ] }) }}"
+      }
+    },
+    {
+      "id": "code-extract",
+      "name": "Черновик поста",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const topic = $('Темы в элементы').item.json.topic;\nconst draft = $json.choices[0].message.content.trim();\nreturn { json: { topic, draft } };"
+      }
+    },
+    {
+      "id": "http-check",
+      "name": "Контроль фактов",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        800,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AI_BASE_URL }}/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.AI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'gpt-4o', temperature: 0, messages: [ { role: 'system', content: 'Ты редактор-контролёр деловых постов. Найди в тексте выдуманные данные: любые проценты, «исследования показывают», «по статистике», конкретные цифры эффекта. Каждое такое место перепиши без цифр, через бытовой пример. Пример правки: «сократила время на 70%» → «стала закрывать день с документами к обеду, а не к вечеру». Остальной текст сохрани дословно. Верни пост целиком и только его.' }, { role: 'user', content: $json.draft } ] }) }}"
+      }
+    },
+    {
+      "id": "code-md",
+      "name": "Сборка markdown",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const topic = $('Черновик поста').item.json.topic;\nlet text = $json.choices[0].message.content.trim();\n// страховка после двух ИИ-шагов: предложения с псевдостатистикой вырезаются кодом\nconst banned = /%|исследовани|по статистике|статистика показыва/i;\ntext = text\n  .split(/\\n+/)\n  .map((p) => p.split(/(?<=[.!?])\\s+/).filter((s) => !banned.test(s)).join(' '))\n  .filter((p) => p.trim())\n  .join('\\n\\n');\nconst slug = topic.toLowerCase().replace(/[^a-zа-яё0-9]+/gi, '-').replace(/^-|-$/g, '').slice(0, 60);\nconst md = `# ${topic}\\n\\n${text}\\n`;\nreturn { json: { topic, slug, chars: text.length }, binary: { data: { data: Buffer.from(md, 'utf-8').toString('base64'), mimeType: 'text/markdown', fileName: slug + '.md' } } };"
+      }
+    },
+    {
+      "id": "write-file",
+      "name": "Файл в папку",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        0
+      ],
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/data/out/{{ $json.slug }}.md",
+        "dataPropertyName": "data"
+      }
+    },
+    {
+      "id": "respond",
+      "name": "Ответ со сводкой",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1400,
+        0
+      ],
+      "parameters": {
+        "respondWith": "allIncomingItems"
+      }
+    }
+  ],
+  "connections": {
+    "Приём тем": {
+      "main": [
+        [
+          {
+            "node": "Темы в элементы",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Темы в элементы": {
+      "main": [
+        [
+          {
+            "node": "Пост через модель",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Пост через модель": {
+      "main": [
+        [
+          {
+            "node": "Черновик поста",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Черновик поста": {
+      "main": [
+        [
+          {
+            "node": "Контроль фактов",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Контроль фактов": {
+      "main": [
+        [
+          {
+            "node": "Сборка markdown",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Сборка markdown": {
+      "main": [
+        [
+          {
+            "node": "Файл в папку",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Файл в папку": {
+      "main": [
+        [
+          {
+            "node": "Ответ со сводкой",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
