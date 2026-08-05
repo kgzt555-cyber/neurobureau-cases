@@ -1,0 +1,28 @@
+﻿1
+00:00:00,160 --> 00:00:03,170
+This video was made from
+text in just three minutes.
+
+2
+00:00:03,860 --> 00:00:06,460
+The avatar and voice
+are synthesized;
+
+3
+00:00:06,460 --> 00:00:08,040
+no filming was needed.
+
+4
+00:00:09,080 --> 00:00:13,170
+That 's how videos are made for
+websites, ads, and training.
+
+5
+00:00:13,550 --> 00:00:17,040
+Just change the text to get a new
+version without a studio or
+
+6
+00:00:17,040 --> 00:00:17,570
+reshoots.
+
