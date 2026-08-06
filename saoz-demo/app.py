@@ -5,13 +5,16 @@ import html
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 
-from engine import ENTER, REJECT, REVIEW, load_rules, qualify
-from extract import extract
+from engine import ENTER, REJECT, REVIEW, load_rules, qualify_documents
+from extract import DocumentError, extract, file_hash
 
 HERE = Path(__file__).parent
 UPLOADS = HERE / "storage" / "uploads"
+MAX_BYTES = 20 * 1024 * 1024
+
 app = FastAPI(title="Конвейер обработки заявок — демо")
 
 CSS = """
@@ -19,6 +22,7 @@ CSS = """
 font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif}
 .wrap{max-width:720px;margin:0 auto;padding:32px 20px 64px}
 h1{font-size:24px;letter-spacing:-.02em;margin:0 0 6px}
+h2{font-size:15px;margin:22px 0 10px}
 .sub{color:#6b7183;margin:0 0 24px;font-size:14px}
 .card{background:#fff;border:1px solid #e2e5ee;border-radius:12px;padding:20px;margin-bottom:14px}
 label{display:block;font-weight:600;font-size:13px;margin-bottom:6px}
@@ -38,29 +42,32 @@ th{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:#6b7183}
 .t-unknown{background:#fdf3e0;color:#b7791f}
 .src{color:#8b91a3;font-size:12px}
 .meta{color:#6b7183;font-size:13px;margin-top:14px}
+.warn{background:#fdf3e0;border:1px solid #f0d9a8;border-radius:10px;padding:13px 15px;
+margin-bottom:14px;font-size:14px}
+.doc{font:12px ui-monospace,Menlo,monospace;color:#6b7183;margin-bottom:8px}
 a{color:#2f5bea}
 """
 
-FORM = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Конвейер обработки заявок — демо</title><style>{css}</style></head><body><div class="wrap">
-<h1>Заявка на сделку</h1>
-<p class="sub">Демо конвейера: документ разбирается ИИ, правила версии {ver} выносят вердикт
-с разбором по каждому фактору.</p>
-<form class="card" method="post" action="/submit" enctype="multipart/form-data">
-  <label>Контрагент</label>
-  <input name="counterparty" placeholder="ООО «Северный Металл»" required>
-  <label>Суть заявки</label>
-  <textarea name="text" placeholder="Поставка металлопроката, оплата по факту"></textarea>
-  <label>Документы (PDF)</label>
-  <input type="file" name="files" accept="application/pdf" multiple required>
-  <button type="submit">Отправить на предквалификацию</button>
-</form>
-</div></body></html>"""
+<title>{title}</title><style>{css}</style></head><body><div class="wrap">{body}</div></body></html>"""
+
+
+def page(title: str, body: str) -> str:
+    return PAGE.format(title=html.escape(title), css=CSS, body=body)
 
 
 def esc(v) -> str:
     return html.escape("—" if v is None else str(v))
+
+
+def money(v) -> str:
+    """120360.0 в отчёте о сделке читается как небрежность."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return esc(v)
+    if float(v).is_integer():
+        return f"{int(v):,}".replace(",", " ")
+    return f"{v:,.2f}".replace(",", " ").replace(".", ",")
 
 
 def factor_rows(factors: list[dict]) -> str:
@@ -70,7 +77,7 @@ def factor_rows(factors: list[dict]) -> str:
         pts = f" (+{f['points']})" if f.get("points") and f["status"] == "passed" else ""
         rows.append(
             f"<tr><td>{esc(f['name'])}{pts}</td>"
-            f"<td>{esc(f['value'])}<br><span class='src'>{esc(f['source'] or 'источник не найден')}</span></td>"
+            f"<td>{money(f['value'])}<br><span class='src'>{esc(f['source'] or 'источник не найден')}</span></td>"
             f"<td><span class='tag t-{f['status']}'>{tags[f['status']]}</span></td></tr>"
         )
     return "".join(rows)
@@ -78,7 +85,21 @@ def factor_rows(factors: list[dict]) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def form() -> str:
-    return FORM.format(css=CSS, ver=load_rules()["version"])
+    return page(
+        "Конвейер обработки заявок — демо",
+        f"""<h1>Заявка на сделку</h1>
+<p class="sub">Демо конвейера: документы разбираются ИИ, правила версии
+{esc(load_rules()['version'])} выносят вердикт с разбором по каждому фактору.</p>
+<form class="card" method="post" action="/submit" enctype="multipart/form-data">
+  <label>Контрагент</label>
+  <input name="counterparty" placeholder="ООО «Северный Металл»" required>
+  <label>Суть заявки</label>
+  <textarea name="text" placeholder="Поставка металлопроката, оплата по факту"></textarea>
+  <label>Документы (PDF с текстовым слоем)</label>
+  <input type="file" name="files" accept="application/pdf" multiple required>
+  <button type="submit">Отправить на предквалификацию</button>
+</form>""",
+    )
 
 
 @app.post("/submit", response_class=HTMLResponse)
@@ -88,52 +109,73 @@ async def submit(
     files: list[UploadFile] = File(...),
 ) -> str:
     UPLOADS.mkdir(parents=True, exist_ok=True)
-    profile: dict = {}
+    profiles: list[dict] = []
+    problems: list[str] = []
     cached = False
-    for upload in files:
-        data = await upload.read()
-        path = UPLOADS / upload.filename
-        path.write_bytes(data)
-        got = extract(path, data)
-        cached = cached or got.pop("_cached", False)
-        # первый непустой источник выигрывает: данные из нескольких файлов не затирают друг друга
-        for key, entry in got.items():
-            if profile.get(key, {}).get("value") is None:
-                profile[key] = entry
 
-    result = qualify(profile)
+    for upload in files:
+        shown = Path(upload.filename or "документ.pdf").name or "документ.pdf"
+        data = await upload.read()
+        if len(data) > MAX_BYTES:
+            problems.append(f"{shown}: файл больше 20 МБ")
+            continue
+        # имя от клиента в путь не попадает: иначе «../../rules.json» перезапишет правила
+        path = UPLOADS / f"{file_hash(data)}.pdf"
+        path.write_bytes(data)
+        try:
+            # синхронное извлечение уводим из event loop, иначе сервер замирает целиком
+            got = await run_in_threadpool(extract, path, data, shown)
+        except DocumentError as e:
+            problems.append(f"{shown}: {e}")
+            continue
+        cached = cached or got.pop("_cached", False)
+        profiles.append(got)
+
+    if not profiles:
+        return page(
+            "Заявка не обработана",
+            "<h1>Не смог прочитать документы</h1>"
+            + "".join(f"<div class='warn'>{esc(p)}</div>" for p in problems)
+            + "<p class='meta'>Демо читает PDF с текстовым слоем. Скан без распознавания "
+            "или файл другого формата разобрать нечем — в такой ситуации заявка уходит "
+            "человеку, а не получает автоматический отказ.</p>"
+            "<p><a href='/'>← Новая заявка</a></p>",
+        )
+
+    result = qualify_documents(profiles)
     css_class = {ENTER: "v-enter", REVIEW: "v-review", REJECT: "v-reject"}[result["verdict"]]
 
-    return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Результат предквалификации</title><style>{CSS}</style></head><body><div class="wrap">
-<h1>Заявка обработана</h1>
+    blocks = []
+    for doc in result["documents"]:
+        head = f"<div class='doc'>{esc(doc['doc'])} · {esc(doc['verdict'])} · {doc['points']} б.</div>"
+        blocks.append(
+            f"<div class='card'>{head}"
+            f"<table><tr><th>Критический фактор</th><th>Значение и источник</th><th>Итог</th></tr>"
+            f"{factor_rows(doc['critical'])}</table>"
+            f"<table style='margin-top:14px'><tr><th>Балльный фактор</th><th>Значение и источник</th><th>Итог</th></tr>"
+            f"{factor_rows(doc['scored'])}</table></div>"
+        )
+
+    warns = "".join(f"<div class='warn'>{esc(p)}</div>" for p in problems)
+    for c in result["conflicts"]:
+        values = ", ".join(f"{esc(v)} ({esc(s)})" for v, s in c["values"].items())
+        warns += (
+            f"<div class='warn'>Разные значения поля «{esc(c['field'])}» в документах: {values}. "
+            "Похоже, приложены документы разных контрагентов.</div>"
+        )
+
+    return page(
+        "Результат предквалификации",
+        f"""<h1>Заявка обработана</h1>
 <p class="sub">{esc(counterparty)}{' · ' + esc(text) if text else ''}</p>
-
 <div class="verdict {css_class}"><b>{esc(result['verdict'])}</b>{esc(result['reason'])}</div>
-
-<div class="card">
-  <table><tr><th>Критический фактор</th><th>Значение и источник</th><th>Итог</th></tr>
-  {factor_rows(result['critical'])}</table>
-</div>
-
-<div class="card">
-  <table><tr><th>Балльный фактор</th><th>Значение и источник</th><th>Итог</th></tr>
-  {factor_rows(result['scored'])}</table>
-</div>
-
-<div class="card">
-  <table><tr><th>Поле профиля</th><th>Значение</th></tr>
-  <tr><td>Поставщик</td><td>{esc(profile.get('supplier', {}).get('value'))}</td></tr>
-  <tr><td>ИНН</td><td>{esc(profile.get('inn', {}).get('value'))}</td></tr>
-  <tr><td>Всего к оплате</td><td>{esc(profile.get('total', {}).get('value'))}</td></tr>
-  <tr><td>НДС</td><td>{esc(profile.get('vat', {}).get('value'))}</td></tr>
-  </table>
-</div>
-
-<p class="meta">Баллов: {result['points']} · правила {esc(result['rules_version'])}
-{' · извлечение взято из кэша по хешу файла, модель повторно не вызывалась' if cached else ''}
-<br>Версия правил сохраняется вместе с вердиктом: заявка останется объяснимой и после того,
-как правила поменяют.</p>
-<p><a href="/">← Новая заявка</a></p>
-</div></body></html>"""
+{warns}
+<h2>Разбор по документам</h2>
+{''.join(blocks)}
+<p class="meta">Правила {esc(result['rules_version'])}. Версия сохраняется вместе с вердиктом:
+заявка останется объяснимой и после того, как правила поменяют.
+{' Извлечение взято из кэша по хешу файла, модель повторно не вызывалась.' if cached else ''}
+<br>Каждый документ считается отдельно: иначе ИНН из приложенного счёта чужой компании
+закрыл бы критический фактор по этой заявке.</p>
+<p><a href="/">← Новая заявка</a></p>""",
+    )

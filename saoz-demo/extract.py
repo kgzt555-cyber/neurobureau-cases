@@ -1,8 +1,8 @@
-"""Извлечение профиля заявки из приложенных документов.
+"""Извлечение профиля заявки из приложенного документа.
 
 Каждое значение тащит с собой источник: файл и страницу. Без этого разбор
-факторов показывает «сумма 4,2 млн → минус 3 балла» и не показывает, откуда
-взялись эти 4,2 млн — и первый же спор превращается в ручную перепроверку.
+факторов показывает «сумма 360 000 → +3 балла» и не показывает, откуда
+взялась сумма — первый же спор превращается в ручную перепроверку пакета.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ HERE = Path(__file__).parent
 load_dotenv(HERE.parent / ".env")
 
 CACHE_PATH = HERE / "storage" / "extraction_cache.json"
+NUMERIC = ("total", "vat", "items_count")
 
 PROMPT = """Из текста документа вытащи поля заявки. Верни СТРОГО JSON:
 
@@ -38,6 +39,10 @@ PROMPT = """Из текста документа вытащи поля заяв�
 """
 
 
+class DocumentError(Exception):
+    """Файл не удалось прочитать как PDF с текстовым слоем."""
+
+
 def file_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
@@ -54,19 +59,51 @@ def _save_cache(cache: dict) -> None:
     CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _number(value):
+    """Модель может вернуть 120360, '120360' или '120 360,00'. Всё, что не число, — None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    cleaned = str(value).replace(" ", "").replace(" ", "").replace(",", ".")
+    cleaned = "".join(c for c in cleaned if c.isdigit() or c in ".-")
+    try:
+        return float(cleaned) if cleaned not in ("", "-", ".") else None
+    except ValueError:
+        return None
+
+
+def _text_or_none(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def pdf_text(path: Path) -> tuple[str, int]:
-    reader = PdfReader(path)
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    return text, len(reader.pages)
+    try:
+        reader = PdfReader(path)
+        pages = len(reader.pages)
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as e:  # битый файл, не-PDF, зашифрованный — всё сюда
+        raise DocumentError(str(e)) from e
+    if not text.strip():
+        raise DocumentError("в файле нет текстового слоя, нужен OCR")
+    return text, pages
 
 
-def extract(path: Path, data: bytes) -> dict:
-    """Профиль заявки. Повтор по тому же файлу берёт кэш, а не зовёт модель заново:
+def extract(path: Path, data: bytes, display_name: str | None = None) -> dict:
+    """Профиль документа. Повтор по тому же файлу берёт кэш, а не зовёт модель:
     иначе ретрай после таймаута вернёт другие числа и другой вердикт."""
+    name = display_name or path.name
     digest = file_hash(data)
     cache = _cache()
     if digest in cache:
-        return {**cache[digest], "_cached": True}
+        cached = json.loads(json.dumps(cache[digest]))  # копия, чтобы не портить кэш
+        for entry in cached.values():
+            if isinstance(entry, dict) and entry.get("source"):
+                entry["source"] = name  # источник — имя текущей загрузки, не прошлой
+        return {**cached, "_file": name, "_cached": True}
 
     text, pages = pdf_text(path)
     client = OpenAI(
@@ -79,13 +116,23 @@ def extract(path: Path, data: bytes) -> dict:
         response_format={"type": "json_object"},
         temperature=0,
     )
-    raw = json.loads(resp.choices[0].message.content)
+    content = resp.choices[0].message.content.strip().strip("`")
+    if content.startswith("json"):
+        content = content[4:]
+    try:
+        raw = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise DocumentError(f"модель вернула не JSON: {e}") from e
 
-    source = f"{path.name}, стр. 1–{pages}" if pages > 1 else path.name
-    profile = {
-        key: {"value": raw.get(key), "source": source if raw.get(key) is not None else None}
+    values = {
+        key: (_number(raw.get(key)) if key in NUMERIC else _text_or_none(raw.get(key)))
         for key in ("inn", "total", "vat", "items_count", "supplier")
+    }
+    source = f"стр. 1–{pages}" if pages > 1 else "стр. 1"
+    profile = {
+        key: {"value": val, "source": f"{name}, {source}" if val is not None else None}
+        for key, val in values.items()
     }
     cache[digest] = profile
     _save_cache(cache)
-    return {**profile, "_cached": False}
+    return {**profile, "_file": name, "_cached": False}

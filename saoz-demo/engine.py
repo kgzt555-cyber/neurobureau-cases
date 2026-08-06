@@ -1,9 +1,11 @@
 """Движок предквалификации: критические и балльные факторы, три исхода.
 
-Два решения, ради которых демо и сделано:
+Три решения, ради которых демо и сделано:
 1. Вердикт хранит версию правил, по которой его посчитали.
 2. «Не смогли извлечь» и «не соответствует критерию» — разные исходы.
    Если их схлопнуть, заявка с плохо распознанным сканом наберёт проходной балл.
+3. Документы не сливаются в один профиль: каждый считается отдельно, иначе
+   ИНН из чужого счёта закроет критический фактор по этой заявке.
 """
 from __future__ import annotations
 
@@ -15,6 +17,9 @@ RULES_PATH = Path(__file__).parent / "rules.json"
 ENTER = "входить"
 REVIEW = "требует человека"
 REJECT = "не входить"
+
+# от мягкого к строгому: итог по заявке — самый строгий из вердиктов по документам
+SEVERITY = {ENTER: 0, REVIEW: 1, REJECT: 2}
 
 
 def load_rules(path: Path = RULES_PATH) -> dict:
@@ -33,16 +38,26 @@ def _compare(value, check: str, expected) -> bool:
     raise ValueError(f"неизвестная проверка: {check}")
 
 
+def _is_blank(value) -> bool:
+    """Пустая строка от модели значит то же, что null: значение не извлеклось."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def _evaluate(rule: dict, profile: dict) -> dict:
-    """Три исхода вместо двух: passed, failed, unknown."""
+    """Три исхода: passed, failed, unknown."""
     entry = profile.get(rule["field"])
     value = entry.get("value") if isinstance(entry, dict) else entry
     source = entry.get("source") if isinstance(entry, dict) else None
+    out = {**rule, "value": value, "source": source}
 
-    if value is None:
-        return {**rule, "status": "unknown", "value": None, "source": source}
-    status = "passed" if _compare(value, rule["check"], rule.get("value")) else "failed"
-    return {**rule, "status": status, "value": value, "source": source}
+    if _is_blank(value):
+        return {**out, "status": "unknown"}
+    try:
+        status = "passed" if _compare(value, rule["check"], rule.get("value")) else "failed"
+    except TypeError:
+        # значение пришло не того типа — это тоже «не извлекли», а не «не выполнил»
+        return {**out, "status": "unknown"}
+    return {**out, "status": status}
 
 
 def qualify(profile: dict, rules: dict | None = None) -> dict:
@@ -71,4 +86,53 @@ def qualify(profile: dict, rules: dict | None = None) -> dict:
         "rules_version": rules["version"],
         "critical": critical,
         "scored": scored,
+    }
+
+
+def find_conflicts(profiles: list[dict]) -> list[dict]:
+    """Разные значения одного поля в разных документах.
+
+    Заявка на одну сделку не может иметь два ИНН. Если такое случилось —
+    документы относятся к разным контрагентам, и решать это должен человек.
+    """
+    conflicts = []
+    for field in ("inn", "supplier"):
+        seen: dict[str, str] = {}
+        for prof in profiles:
+            entry = prof.get(field) or {}
+            value = entry.get("value")
+            if _is_blank(value):
+                continue
+            seen.setdefault(str(value).strip(), entry.get("source") or "?")
+        if len(seen) > 1:
+            conflicts.append({"field": field, "values": seen})
+    return conflicts
+
+
+def qualify_documents(profiles: list[dict], rules: dict | None = None) -> dict:
+    """Вердикт по заявке: каждый документ считается сам по себе.
+
+    Слить поля из всех файлов в один профиль — заманчиво и опасно: ИНН из
+    приложенного счёта другой компании закроет критический фактор, а сумма
+    из первого документа скроет превышение лимита во втором.
+    """
+    rules = rules or load_rules()
+    per_doc = [{**qualify(p, rules), "doc": (p.get("_file") or "документ")} for p in profiles]
+    conflicts = find_conflicts(profiles)
+
+    strictest = max(per_doc, key=lambda r: SEVERITY[r["verdict"]])
+    verdict, reason = strictest["verdict"], strictest["reason"]
+
+    if conflicts and SEVERITY[verdict] < SEVERITY[REVIEW]:
+        verdict = REVIEW
+        reason = "документы относятся к разным контрагентам"
+    elif len(per_doc) > 1 and SEVERITY[verdict] > 0:
+        reason = f"{reason} (документ: {strictest['doc']})"
+
+    return {
+        "verdict": verdict,
+        "reason": reason,
+        "rules_version": rules["version"],
+        "documents": per_doc,
+        "conflicts": conflicts,
     }
