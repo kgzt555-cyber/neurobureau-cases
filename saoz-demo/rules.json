@@ -1,0 +1,50 @@
+{
+  "version": "v3",
+  "updated": "2026-08-07",
+  "comment": "Версия хранится в каждом вердикте: заявка, посчитанная по v3, останется объяснимой и после выхода v4",
+  "critical": [
+    {
+      "id": "inn_found",
+      "name": "ИНН контрагента распознан",
+      "field": "inn",
+      "check": "not_empty"
+    },
+    {
+      "id": "amount_limit",
+      "name": "Сумма сделки не выше лимита 500 000 ₽",
+      "field": "total",
+      "check": "lte",
+      "value": 500000
+    }
+  ],
+  "scored": [
+    {
+      "id": "vat",
+      "name": "НДС выделен в документах",
+      "field": "vat",
+      "check": "gt",
+      "value": 0,
+      "points": 2
+    },
+    {
+      "id": "amount_significant",
+      "name": "Сумма сделки от 50 000 ₽",
+      "field": "total",
+      "check": "gte",
+      "value": 50000,
+      "points": 3
+    },
+    {
+      "id": "has_items",
+      "name": "Позиции расшифрованы построчно",
+      "field": "items_count",
+      "check": "gte",
+      "value": 2,
+      "points": 2
+    }
+  ],
+  "thresholds": {
+    "enter": 5,
+    "review": 3
+  }
+}
